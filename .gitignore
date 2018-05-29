@@ -1,0 +1,9 @@
+.vagrant
+/tmp
+.DS_Store
+.ruby-version
+*.box
+*.box.*
+knife.rb
+.kitchen
+berks-cookbooks

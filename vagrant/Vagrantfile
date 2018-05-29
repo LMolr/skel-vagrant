@@ -1,0 +1,182 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+# frozen_string_literal: true
+
+# rubocop:disable Lint/MissingCopEnableDirective
+# rubocop:disable Metrics/MethodLength
+# rubocop:disable Naming/UncommunicativeMethodParamName
+
+# { Settings.
+VAGRANTFILE_API_VERSION = '2'
+DEBUG = false
+FORWARDED_PORTS = [
+  # { host: 8080, guest: 80 }
+].freeze
+VM_NAME = 'my-vm'
+VM_HOSTNAME = 'my-vm'
+VM_BOX = 'my-box'
+VM_BOOT_TIMEOUT = 120 * 60
+VM_MEMORY = 4096
+VM_CPUS = 4
+VM_EXECUTION_CAP = 70
+VM_ADDR = nil
+PROXY_ENABLE = false
+PROXY_HTTP = 'http://my-proxy.localdomain'
+PROXY_HTTPS = PROXY_HTTP
+PROXY_NO_PROXY = 'lan,local,localdomain,localhost,127.0.0.1'
+SYNCED_FOLDERS = [
+  { host: '../work', guest: '/work', mount_options: [] },
+  { host: '../var_log_chef', guest: '/var/log/chef', mount_options: [] }
+].freeze
+# { Settings - Provisioning.
+PROVISION_ENABLE = true
+# }
+# { Settings - Provisioning - Shell.
+PROVISION_SHELL_ENABLE = true
+# }
+# { Settings - Provisioning - Ansible.
+PROVISION_ANSIBLE_ENABLE = false
+# }
+# { Settings - Provision - Chef.
+PROVISION_CHEF_ENABLE = false
+PROVISION_CHEF_OMNIBUS_ENABLE = false
+PROVISION_CHEF_VERSION = '14'
+PROVISION_CHEF_LOG_LEVEL = :info
+# Will fallback to VM_NAME if nil.
+PROVISION_CHEF_NODE_NAME = nil
+PROVISION_CHEF_ENVIRONMENT = 'local-vagrant'
+PROVISION_CHEF_RUN_LIST = [
+  'role[my-vm]'
+].freeze
+# }
+
+def self.check_plugins!(*plugin_names)
+  plugin_names.each do |plugin_name|
+    unless Vagrant.has_plugin? plugin_name
+      warn "The plugin '#{plugin_name}' is required."
+      exit(-1)
+    end
+  end
+end
+
+# { Pre-requisites.
+check_plugins!(
+  'vagrant-vbguest',
+  'vagrant-cachier',
+  'vagrant-proxyconf'
+)
+# }
+
+Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
+  config.vm.define(VM_NAME) do |vm|
+    vm.vm.box          = VM_BOX
+    vm.vm.hostname     = VM_HOSTNAME || VM_NAME
+    vm.vm.boot_timeout = VM_BOOT_TIMEOUT
+    vm.vm.network('private_network', ip: VM_ADDR) unless VM_ADDR.nil?
+    config_proxy(vm)
+    virtualbox_customize(vm)
+    setup_cache(vm)
+    sync_folders(vm)
+    forward_ports(vm)
+    provision(config, vm)
+  end
+end
+
+def setup_cache(vm)
+  vm.cache.auto_detect = true
+  vm.cache.scope       = :box
+end
+
+def config_proxy(vm)
+  vm.proxy.http     = PROXY_ENABLE ? PROXY_HTTP : ''
+  vm.proxy.https    = PROXY_ENABLE ? PROXY_HTTPS : ''
+  vm.proxy.no_proxy = PROXY_ENABLE ? PROXY_NO_PROXY : ''
+end
+
+def virtualbox_customize(vm)
+  vm.vm.provider 'virtualbox' do |vbox|
+    vbox.cpus         = VM_CPUS
+    vbox.linked_clone = true
+    vbox.memory       = VM_MEMORY
+    vbox.name         = VM_NAME
+    vbox.customize ['modifyvm', :id, '--natdnsproxy1', 'on']
+    vbox.customize ['modifyvm', :id, '--cpuexecutioncap', VM_EXECUTION_CAP]
+  end
+end
+
+def sync_folders(vm)
+  SYNCED_FOLDERS.each do |synced_folder|
+    vm.vm.synced_folder(
+      synced_folder[:host],
+      synced_folder[:guest],
+      mount_options: synced_folder[:mount_options]
+    )
+  end
+end
+
+def forward_ports(vm)
+  FORWARDED_PORTS.each do |fwp|
+    vm.vm.network 'forwarded_port', fwp
+  end
+end
+
+def provision(config, vm)
+  return unless PROVISION_ENABLE
+  provision_shell(config, vm)
+  provision_ansible(config, vm)
+  provision_chef(config, vm)
+end
+
+def provision_shell(_config, vm)
+  return unless PROVISION_SHELL_ENABLE
+  Dir.glob('./provision/shell/*.sh').each do |script_pth|
+    script_name = File.basename(script_pth)
+    vm.vm.provision(
+      :shell,
+      name: script_name,
+      path: script_pth,
+      privileged: true,
+      upload_path: '/home/vagrant/shell-provision.sh'
+    )
+  end
+end
+
+def provision_ansible(_config, vm)
+  return unless PROVISION_ANSIBLE_ENABLE
+  vm.vm.provision(
+    :ansible,
+    playbook: 'ansible/provision.yml',
+    raw_arguments: '-vv'
+  )
+end
+
+def provision_chef(config, vm)
+  return unless PROVISION_CHEF_ENABLE
+  if PROVISION_CHEF_OMNIBUS_ENABLE
+    check_plugins! 'vagrant-omnibus'
+    # vm.omnibus.chef_version = PROVISION_CHEF_VERSION
+    vm.omnibus.cache_packages = true
+  end
+  check_plugins! 'vagrant-berkshelf'
+  config.berkshelf.enabled        = true
+  config.berkshelf.berksfile_path = './provision/chef/Berksfile'
+  unless File.exist? './.chef/knife.rb'
+    raise 'Symlink your knife.rb to ./.chef/knife.rb !'
+  end
+  # If you need to disable SSL verify on Berkshelf:
+  #   `echo '{"ssl": { "verify": false }}' > ~/.berkshelf/config.json`
+
+  vm.vm.provision :chef_zero do |chef|
+    chef.install           = false
+    chef.node_name         = PROVISION_CHEF_NODE_NAME || VM_HOSTNAME || VM_NAME
+    chef.log_level         = PROVISION_CHEF_LOG_LEVEL
+    chef.arguments         = '-Fdoc -L /var/log/chef/chef-client.log'
+    chef.environment       = PROVISION_CHEF_ENVIRONMENT
+    chef.run_list          = PROVISION_CHEF_RUN_LIST
+    # chef.cookbooks_path = './provision/chef/cookbooks' # Vendored by vagrant-berkshelf.
+    chef.data_bags_path    = './provision/chef/data_bags'
+    chef.environments_path = './provision/chef/environments'
+    chef.nodes_path        = './provision/chef/nodes'
+    chef.roles_path        = './provision/chef/roles'
+  end
+end
